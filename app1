@@ -1,0 +1,392 @@
+import streamlit as st
+import google.generativeai as genai
+import pandas as pd
+import io
+from PIL import Image
+import json
+from typing import Tuple, List, Optional
+from openpyxl.chart import (
+    BarChart, LineChart, PieChart, ScatterChart, 
+    DoughnutChart, Reference
+)
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.series import DataPoint
+from openpyxl.drawing.fill import SolidColorFillProperties
+from openpyxl.drawing.colors import ColorChoice
+
+# Configuration
+st.set_page_config(
+    page_title="Image to Excel Converter", 
+    page_icon="📊",
+    layout="wide"
+)
+
+SUPPORTED_CHART_TYPES = [
+    'bar', 'column', 'line', 'pie', 'doughnut', 
+    'scatter', 'area', 'table'
+]
+
+def validate_api_key(api_key: str) -> bool:
+    """Validate API key format."""
+    if not api_key or len(api_key.strip()) < 20:
+        return False
+    return True
+
+def get_vision_model() -> str:
+    """Finds the best available vision-capable model."""
+    try:
+        models = [
+            m.name for m in genai.list_models() 
+            if 'generateContent' in m.supported_generation_methods
+        ]
+        
+        priorities = ['gemini-2.5-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
+        
+        for priority in priorities:
+            for model in models:
+                if priority in model:
+                    return model
+        
+        # Fallback to any Gemini model
+        for model in models:
+            if 'gemini' in model.lower():
+                return model
+                
+        return 'models/gemini-1.5-flash'
+    except Exception as e:
+        st.warning(f"Model detection failed: {e}. Using fallback.")
+        return 'models/gemini-1.5-flash'
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def process_image_cached(
+    image_bytes: bytes, 
+    api_key: str
+) -> Tuple[str, str, List[str]]:
+    """Cached version of image processing to avoid repeated API calls."""
+    image = Image.open(io.BytesIO(image_bytes))
+    return process_image(image, api_key)
+
+def process_image(
+    image: Image.Image, 
+    api_key: str
+) -> Tuple[str, str, List[str]]:
+    """Process image using Gemini AI to extract chart data."""
+    try:
+        genai.configure(api_key=api_key)
+    except Exception as e:
+        st.error(f"API configuration failed: {e}")
+        raise
+    
+    # Use auto-detection or fallback
+    model_name = get_vision_model()
+    
+    try:
+        model = genai.GenerativeModel(model_name)
+    except Exception as e:
+        st.error(f"Failed to initialize model {model_name}: {e}")
+        raise
+
+    st.info(f"Using AI Model: `{model_name}`")
+
+    prompt = f"""
+    Analyze this image containing a chart or table.
+    
+    Tasks:
+    1. Identify the chart type from: {SUPPORTED_CHART_TYPES}
+       (Note: 'doughnut' is a pie chart with a hole in the center)
+    2. Extract all data accurately
+    3. Extract the HEX color codes (#RRGGBB) for each category/series
+    
+    Return ONLY valid JSON:
+    {{
+        "chart_type": "detected_type",
+        "csv_data": "Category,Value\\nA,10\\nB,20",
+        "colors": ["#FF0000", "#00FF00"]
+    }}
+    
+    CRITICAL: 
+    - Colors list must match data row order (excluding header)
+    - No markdown code blocks
+    - No introductory text
+    - Valid JSON only
+    """
+    
+    with st.spinner('🔍 Analyzing image with AI...'):
+        try:
+            response = model.generate_content([prompt, image])
+            text_response = response.text.strip()
+            
+            # Clean response
+            text_response = (
+                text_response
+                .replace('```json', '')
+                .replace('```', '')
+                .strip()
+            )
+            
+            result = json.loads(text_response)
+            chart_type = result.get("chart_type", "bar").lower()
+            csv_string = result.get("csv_data", "")
+            colors = result.get("colors", [])
+            
+            # Validate chart type
+            if chart_type not in SUPPORTED_CHART_TYPES:
+                st.warning(f"Unknown chart type '{chart_type}', defaulting to 'bar'")
+                chart_type = "bar"
+                
+            return chart_type, csv_string, colors
+            
+        except json.JSONDecodeError as e:
+            st.warning(f"JSON parsing failed: {e}. Attempting fallback.")
+            return "bar", text_response, []
+        except Exception as e:
+            st.error(f"Image processing failed: {e}")
+            raise
+
+def apply_colors_to_series(
+    series, 
+    colors: List[str], 
+    num_points: int
+) -> None:
+    """Apply colors to chart series data points."""
+    if not colors:
+        return
+        
+    series.dPt = []
+    for i in range(min(num_points, len(colors))):
+        try:
+            color_hex = colors[i].replace("#", "").upper()
+            
+            # Validate hex format
+            if len(color_hex) != 6:
+                continue
+                
+            pt = DataPoint(idx=i)
+            
+            # Correct way to apply solid fill
+            fill = SolidColorFillProperties()
+            fill.solidFill = ColorChoice(srgbClr=color_hex)
+            pt.graphicalProperties.solidFill = fill
+            
+            series.dPt.append(pt)
+        except Exception as e:
+            st.warning(f"Failed to apply color {colors[i]}: {e}")
+            continue
+
+def generate_excel(
+    df: pd.DataFrame, 
+    chart_type: str, 
+    colors: List[str]
+) -> io.BytesIO:
+    """Generate Excel file with native chart."""
+    output = io.BytesIO()
+    
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Data')
+        workbook = writer.book
+        worksheet = writer.sheets['Data']
+        
+        # Create appropriate chart type
+        if "doughnut" in chart_type:
+            chart = DoughnutChart()
+            chart.style = 26
+        elif "pie" in chart_type:
+            chart = PieChart()
+        elif "line" in chart_type:
+            chart = LineChart()
+        elif "scatter" in chart_type:
+            chart = ScatterChart()
+        elif "bar" in chart_type:
+            chart = BarChart()
+            chart.type = "bar"
+            chart.style = 10
+        else:  # column (default)
+            chart = BarChart()
+            chart.type = "col"
+            chart.style = 10
+            
+        chart.title = f"{chart_type.title()} Chart"
+        chart.height = 10
+        chart.width = 20
+        
+        # Data ranges
+        max_row = len(df) + 1
+        max_col = len(df.columns)
+        
+        # Find category column (first string/object column)
+        cat_col_idx = 1
+        for idx, dtype in enumerate(df.dtypes):
+            if dtype == 'object' or pd.api.types.is_string_dtype(dtype):
+                cat_col_idx = idx + 1
+                break
+        
+        cats = Reference(
+            worksheet, 
+            min_col=cat_col_idx, 
+            min_row=2, 
+            max_row=max_row
+        )
+        
+        # Add numeric series
+        series_added = False
+        for idx, dtype in enumerate(df.dtypes):
+            col_idx = idx + 1
+            if col_idx == cat_col_idx:
+                continue
+            
+            if pd.api.types.is_numeric_dtype(dtype):
+                data = Reference(
+                    worksheet, 
+                    min_col=col_idx, 
+                    min_row=1, 
+                    max_row=max_row
+                )
+                chart.add_data(data, titles_from_data=True)
+                series_added = True
+        
+        if not series_added:
+            st.warning("No numeric data found for chart")
+            return output
+                
+        chart.set_categories(cats)
+        
+        # Apply colors
+        if colors and len(chart.series) > 0:
+            if "pie" in chart_type or "doughnut" in chart_type:
+                chart.dataLabels = DataLabelList()
+                chart.dataLabels.showVal = True
+                chart.dataLabels.showPercent = True
+                apply_colors_to_series(chart.series[0], colors, len(df))
+            else:
+                chart.varyColors = True
+                apply_colors_to_series(chart.series[0], colors, len(df))
+        
+        worksheet.add_chart(chart, "E2")
+            
+    output.seek(0)
+    return output
+
+# ========== MAIN APP ==========
+
+st.title("📊 Image to Excel Converter")
+st.markdown("""
+Upload an image of a chart or table, and we'll convert it to an Excel file 
+with a **native editable chart** using AI! 🤖✨
+""")
+
+# Sidebar for settings
+with st.sidebar:
+    st.header("⚙️ Settings")
+    api_key = st.text_input(
+        "Google Gemini API Key", 
+        type="password",
+        help="Get your API key from https://makersuite.google.com/app/apikey"
+    )
+    
+    st.markdown("---")
+    st.markdown("""
+    ### 📖 How to use:
+    1. Enter your Gemini API key
+    2. Upload a chart/table image
+    3. Click 'Convert to Excel'
+    4. Download your Excel file!
+    
+    ### ✅ Supported charts:
+    - Bar & Column charts
+    - Line charts
+    - Pie & Doughnut charts
+    - Scatter plots
+    - Tables
+    """)
+
+# Main content
+uploaded_file = st.file_uploader(
+    "Choose an image...", 
+    type=["png", "jpg", "jpeg", "webp"],
+    help="Upload a clear image of your chart or table"
+)
+
+if uploaded_file is not None:
+    # Display uploaded image
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("📸 Uploaded Image")
+        image = Image.open(uploaded_file)
+        st.image(image, use_column_width=True)
+    
+    with col2:
+        st.subheader("🎯 Analysis")
+        
+        if not api_key:
+            st.warning("⚠️ Please enter your API key in the sidebar to proceed.")
+        elif not validate_api_key(api_key):
+            st.error("❌ Invalid API key format. Please check your key.")
+        else:
+            if st.button('🚀 Convert to Excel', type="primary", use_container_width=True):
+                try:
+                    # Process image
+                    image_bytes = uploaded_file.getvalue()
+                    chart_type, csv_string, colors = process_image_cached(
+                        image_bytes, 
+                        api_key.strip()
+                    )
+                    
+                    st.success(f"✅ Detected Chart Type: **{chart_type.title()}**")
+                    
+                    if colors:
+                        st.write("🎨 Detected Colors:")
+                        color_html = "".join([
+                            f'<span style="display:inline-block; width:30px; height:30px; '
+                            f'background-color:{c}; margin:2px; border:1px solid #ccc;"></span>'
+                            for c in colors
+                        ])
+                        st.markdown(color_html, unsafe_allow_html=True)
+                    
+                    # Parse CSV
+                    df = pd.read_csv(io.StringIO(csv_string))
+                    
+                    st.write("📊 Extracted Data:")
+                    st.dataframe(df, use_container_width=True)
+                    
+                    # Generate Excel
+                    with st.spinner('📝 Generating Excel file...'):
+                        excel_data = generate_excel(df, chart_type, colors)
+                    
+                    st.success("✅ Excel file ready!")
+                    
+                    st.download_button(
+                        label="📥 Download Excel File",
+                        data=excel_data,
+                        file_name=f"chart_{chart_type}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True
+                    )
+                    
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+                    with st.expander("🔍 Debug Information"):
+                        st.code(csv_string if 'csv_string' in locals() else "No data")
+                        st.exception(e)
+
+else:
+    st.info("👆 Upload an image to get started!")
+    
+    # Example section
+    with st.expander("💡 See Example"):
+        st.markdown("""
+        This tool works best with:
+        - Clear, high-resolution images
+        - Charts with visible labels and values
+        - Standard chart formats (bar, line, pie, etc.)
+        - Images with distinct colors for different categories
+        """)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666;'>
+    Built with ❤️ using Streamlit + Google Gemini AI
+</div>
+""", unsafe_allow_html=True)
